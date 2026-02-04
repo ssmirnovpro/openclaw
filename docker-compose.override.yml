@@ -1,0 +1,8 @@
+services:
+  openclaw-gateway:
+    build:
+      dockerfile: Dockerfile.local
+      args:
+        OPENCLAW_DOCKER_APT_PACKAGES: "chromium"
+    environment:
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
