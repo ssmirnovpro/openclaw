@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { withTempHome } from "./home-env.test-harness.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createConfigIO } from "./io.js";
 
 describe("config io write", () => {
@@ -9,6 +9,76 @@ describe("config io write", () => {
     warn: () => {},
     error: () => {},
   };
+
+  type HomeEnvSnapshot = {
+    home: string | undefined;
+    userProfile: string | undefined;
+    homeDrive: string | undefined;
+    homePath: string | undefined;
+    stateDir: string | undefined;
+  };
+
+  const snapshotHomeEnv = (): HomeEnvSnapshot => ({
+    home: process.env.HOME,
+    userProfile: process.env.USERPROFILE,
+    homeDrive: process.env.HOMEDRIVE,
+    homePath: process.env.HOMEPATH,
+    stateDir: process.env.OPENCLAW_STATE_DIR,
+  });
+
+  const restoreHomeEnv = (snapshot: HomeEnvSnapshot) => {
+    const restoreKey = (key: string, value: string | undefined) => {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    };
+    restoreKey("HOME", snapshot.home);
+    restoreKey("USERPROFILE", snapshot.userProfile);
+    restoreKey("HOMEDRIVE", snapshot.homeDrive);
+    restoreKey("HOMEPATH", snapshot.homePath);
+    restoreKey("OPENCLAW_STATE_DIR", snapshot.stateDir);
+  };
+
+  let fixtureRoot = "";
+  let caseId = 0;
+
+  async function withTempHome(prefix: string, fn: (home: string) => Promise<void>): Promise<void> {
+    const safePrefix = prefix.trim().replace(/[^a-zA-Z0-9._-]+/g, "-") || "tmp";
+    const home = path.join(fixtureRoot, `${safePrefix}${caseId++}`);
+    await fs.mkdir(path.join(home, ".openclaw"), { recursive: true });
+
+    const snapshot = snapshotHomeEnv();
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    process.env.OPENCLAW_STATE_DIR = path.join(home, ".openclaw");
+
+    if (process.platform === "win32") {
+      const match = home.match(/^([A-Za-z]:)(.*)$/);
+      if (match) {
+        process.env.HOMEDRIVE = match[1];
+        process.env.HOMEPATH = match[2] || "\\";
+      }
+    }
+
+    try {
+      await fn(home);
+    } finally {
+      restoreHomeEnv(snapshot);
+    }
+  }
+
+  beforeAll(async () => {
+    fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-config-io-"));
+  });
+
+  afterAll(async () => {
+    if (!fixtureRoot) {
+      return;
+    }
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  });
 
   it("persists caller changes onto resolved config without leaking runtime defaults", async () => {
     await withTempHome("openclaw-config-io-", async (home) => {
@@ -107,6 +177,68 @@ describe("config io write", () => {
         port: 18789,
         auth: { mode: "token" },
       });
+    });
+  });
+
+  it("does not reintroduce Slack/Discord legacy dm.policy defaults when writing", async () => {
+    await withTempHome("openclaw-config-io-", async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      await fs.writeFile(
+        configPath,
+        JSON.stringify(
+          {
+            channels: {
+              discord: {
+                dmPolicy: "pairing",
+                dm: { enabled: true, policy: "pairing" },
+              },
+              slack: {
+                dmPolicy: "pairing",
+                dm: { enabled: true, policy: "pairing" },
+              },
+            },
+            gateway: { port: 18789 },
+          },
+          null,
+          2,
+        ),
+        "utf-8",
+      );
+
+      const io = createConfigIO({
+        env: {} as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+
+      const snapshot = await io.readConfigFileSnapshot();
+      expect(snapshot.valid).toBe(true);
+
+      const next = structuredClone(snapshot.config);
+      // Simulate doctor removing legacy keys while keeping dm enabled.
+      if (next.channels?.discord?.dm && typeof next.channels.discord.dm === "object") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test helper
+        delete (next.channels.discord.dm as any).policy;
+      }
+      if (next.channels?.slack?.dm && typeof next.channels.slack.dm === "object") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test helper
+        delete (next.channels.slack.dm as any).policy;
+      }
+
+      await io.writeConfigFile(next);
+
+      const persisted = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
+        channels?: {
+          discord?: { dm?: Record<string, unknown>; dmPolicy?: unknown };
+          slack?: { dm?: Record<string, unknown>; dmPolicy?: unknown };
+        };
+      };
+
+      expect(persisted.channels?.discord?.dmPolicy).toBe("pairing");
+      expect(persisted.channels?.discord?.dm).toEqual({ enabled: true });
+      expect(persisted.channels?.slack?.dmPolicy).toBe("pairing");
+      expect(persisted.channels?.slack?.dm).toEqual({ enabled: true });
     });
   });
 
