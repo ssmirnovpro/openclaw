@@ -6,6 +6,6 @@ services:
         OPENCLAW_DOCKER_APT_PACKAGES: "chromium"
     environment:
       PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
     volumes:
-      - /Users/sergeysmirnov/projects/long-memory:/home/node/.openclaw/workspace/projects/long-memory
-      - /Users/sergeysmirnov/projects/openclaw:/home/node/.openclaw/workspace/projects/openclaw
+      - /Users/sergeysmirnov/shprojects:/home/node/.openclaw/workspace/projects
