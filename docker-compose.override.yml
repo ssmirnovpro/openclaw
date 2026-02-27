@@ -8,4 +8,4 @@ services:
       PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
     volumes:
-      - /Users/sergeysmirnov/shprojects:/home/node/.openclaw/workspace/projects
+      - /Users/ssmirnov/shprojects:/home/node/.openclaw/workspace/projects
