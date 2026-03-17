@@ -19,13 +19,16 @@ import { createInternalHookEvent, triggerInternalHook } from "../../hooks/intern
 import { getMachineDisplayName } from "../../infra/machine-name.js";
 import { generateSecureToken } from "../../infra/secure-random.js";
 import { getMemorySearchManager } from "../../memory/index.js";
+import { resolveSignalReactionLevel } from "../../plugin-sdk-internal/signal.js";
+import {
+  resolveTelegramInlineButtonsScope,
+  resolveTelegramReactionLevel,
+} from "../../plugin-sdk-internal/telegram.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { prepareProviderRuntimeAuth } from "../../plugins/provider-runtime.js";
 import { type enqueueCommand, enqueueCommandInLane } from "../../process/command-queue.js";
 import { isCronSessionKey, isSubagentSessionKey } from "../../routing/session-key.js";
 import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
-import { resolveSignalReactionLevel } from "../../signal/reaction-level.js";
-import { resolveTelegramInlineButtonsScope } from "../../telegram/inline-buttons.js";
-import { resolveTelegramReactionLevel } from "../../telegram/reaction-level.js";
 import { buildTtsSystemPromptHint } from "../../tts/tts.js";
 import { resolveUserPath } from "../../utils.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
@@ -41,7 +44,11 @@ import { formatUserTime, resolveUserTimeFormat, resolveUserTimezone } from "../d
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../defaults.js";
 import { resolveOpenClawDocsPath } from "../docs-path.js";
 import { resolveMemorySearchConfig } from "../memory-search.js";
-import { getApiKeyForModel, resolveModelAuthMode } from "../model-auth.js";
+import {
+  applyLocalNoAuthHeaderOverride,
+  getApiKeyForModel,
+  resolveModelAuthMode,
+} from "../model-auth.js";
 import { supportsModelTools } from "../model-tool-support.js";
 import { ensureOpenClawModelsJson } from "../models-config.js";
 import { createConfiguredOllamaStreamFn } from "../ollama-stream.js";
@@ -57,7 +64,10 @@ import { ensureRuntimePluginsLoaded } from "../runtime-plugins.js";
 import { resolveSandboxContext } from "../sandbox.js";
 import { repairSessionFileIfNeeded } from "../session-file-repair.js";
 import { guardSessionManager } from "../session-tool-result-guard-wrapper.js";
-import { sanitizeToolUseResultPairing } from "../session-transcript-repair.js";
+import {
+  repairToolUseResultPairing,
+  sanitizeToolUseResultPairing,
+} from "../session-transcript-repair.js";
 import {
   acquireSessionWriteLock,
   resolveSessionLockMaxHoldFromTimeout,
@@ -72,7 +82,7 @@ import {
 import { resolveTranscriptPolicy } from "../transcript-policy.js";
 import {
   compactWithSafetyTimeout,
-  EMBEDDED_COMPACTION_TIMEOUT_MS,
+  resolveCompactionTimeoutMs,
 } from "./compaction-safety-timeout.js";
 import { buildEmbeddedExtensionFactories } from "./extensions.js";
 import {
@@ -83,7 +93,7 @@ import {
 import { getDmHistoryLimitFromSessionKey, limitHistoryTurns } from "./history.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
 import { log } from "./logger.js";
-import { buildModelAliasLines, resolveModel } from "./model.js";
+import { buildModelAliasLines, resolveModelAsync } from "./model.js";
 import { buildEmbeddedSandboxInfo } from "./sandbox-info.js";
 import { prewarmSessionFile, trackSessionManagerAccess } from "./session-manager-cache.js";
 import { resolveEmbeddedRunSkillEntries } from "./skills-runtime.js";
@@ -139,6 +149,9 @@ export type CompactEmbeddedPiSessionParams = {
   enqueue?: typeof enqueueCommand;
   extraSystemPrompt?: string;
   ownerNumbers?: string[];
+  abortSignal?: AbortSignal;
+  /** Allow runtime plugins for this compaction to late-bind the gateway subagent. */
+  allowGatewaySubagentBinding?: boolean;
 };
 
 type CompactionMessageMetrics = {
@@ -376,6 +389,7 @@ export async function compactEmbeddedPiSessionDirect(
   ensureRuntimePluginsLoaded({
     config: params.config,
     workspaceDir: resolvedWorkspace,
+    allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
   });
   const prevCwd = process.cwd();
 
@@ -419,7 +433,7 @@ export async function compactEmbeddedPiSessionDirect(
   };
   const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
   await ensureOpenClawModelsJson(params.config, agentDir);
-  const { model, error, authStorage, modelRegistry } = resolveModel(
+  const { model, error, authStorage, modelRegistry } = await resolveModelAsync(
     provider,
     modelId,
     agentDir,
@@ -429,9 +443,11 @@ export async function compactEmbeddedPiSessionDirect(
     const reason = error ?? `Unknown model: ${provider}/${modelId}`;
     return fail(reason);
   }
+  let runtimeModel = model;
+  let apiKeyInfo: Awaited<ReturnType<typeof getApiKeyForModel>> | null = null;
   try {
-    const apiKeyInfo = await getApiKeyForModel({
-      model,
+    apiKeyInfo = await getApiKeyForModel({
+      model: runtimeModel,
       cfg: params.config,
       profileId: authProfileId,
       agentDir,
@@ -440,17 +456,36 @@ export async function compactEmbeddedPiSessionDirect(
     if (!apiKeyInfo.apiKey) {
       if (apiKeyInfo.mode !== "aws-sdk") {
         throw new Error(
-          `No API key resolved for provider "${model.provider}" (auth mode: ${apiKeyInfo.mode}).`,
+          `No API key resolved for provider "${runtimeModel.provider}" (auth mode: ${apiKeyInfo.mode}).`,
         );
       }
-    } else if (model.provider === "github-copilot") {
-      const { resolveCopilotApiToken } = await import("../../providers/github-copilot-token.js");
-      const copilotToken = await resolveCopilotApiToken({
-        githubToken: apiKeyInfo.apiKey,
-      });
-      authStorage.setRuntimeApiKey(model.provider, copilotToken.token);
     } else {
-      authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+      const preparedAuth = await prepareProviderRuntimeAuth({
+        provider: runtimeModel.provider,
+        config: params.config,
+        workspaceDir: resolvedWorkspace,
+        env: process.env,
+        context: {
+          config: params.config,
+          agentDir,
+          workspaceDir: resolvedWorkspace,
+          env: process.env,
+          provider: runtimeModel.provider,
+          modelId,
+          model: runtimeModel,
+          apiKey: apiKeyInfo.apiKey,
+          authMode: apiKeyInfo.mode,
+          profileId: apiKeyInfo.profileId,
+        },
+      });
+      if (preparedAuth?.baseUrl) {
+        runtimeModel = { ...runtimeModel, baseUrl: preparedAuth.baseUrl };
+      }
+      const runtimeApiKey = preparedAuth?.apiKey ?? apiKeyInfo.apiKey;
+      if (!runtimeApiKey) {
+        throw new Error(`Provider "${runtimeModel.provider}" runtime auth returned no apiKey.`);
+      }
+      authStorage.setRuntimeApiKey(runtimeModel.provider, runtimeApiKey);
     }
   } catch (err) {
     const reason = describeUnknownError(err);
@@ -515,13 +550,15 @@ export async function compactEmbeddedPiSessionDirect(
       cfg: params.config,
       provider,
       modelId,
-      modelContextWindow: model.contextWindow,
+      modelContextWindow: runtimeModel.contextWindow,
       defaultTokens: DEFAULT_CONTEXT_TOKENS,
     });
-    const effectiveModel =
-      ctxInfo.tokens < (model.contextWindow ?? Infinity)
-        ? { ...model, contextWindow: ctxInfo.tokens }
-        : model;
+    const effectiveModel = applyLocalNoAuthHeaderOverride(
+      ctxInfo.tokens < (runtimeModel.contextWindow ?? Infinity)
+        ? { ...runtimeModel, contextWindow: ctxInfo.tokens }
+        : runtimeModel,
+      apiKeyInfo,
+    );
 
     const runAbortController = new AbortController();
     const toolsRaw = createOpenClawCodingTools({
@@ -539,6 +576,7 @@ export async function compactEmbeddedPiSessionDirect(
       groupSpace: params.groupSpace,
       spawnedBy: params.spawnedBy,
       senderIsOwner: params.senderIsOwner,
+      allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
       agentDir,
       workspaceDir: effectiveWorkspace,
       config: params.config,
@@ -549,7 +587,7 @@ export async function compactEmbeddedPiSessionDirect(
       modelAuthMode: resolveModelAuthMode(model.provider, params.config),
     });
     const tools = sanitizeToolsForGoogle({
-      tools: supportsModelTools(model) ? toolsRaw : [],
+      tools: supportsModelTools(runtimeModel) ? toolsRaw : [],
       provider,
     });
     const allowedToolNames = collectAllowedToolNames({ tools });
@@ -680,10 +718,11 @@ export async function compactEmbeddedPiSessionDirect(
     });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
 
+    const compactionTimeoutMs = resolveCompactionTimeoutMs(params.config);
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
       maxHoldMs: resolveSessionLockMaxHoldFromTimeout({
-        timeoutMs: EMBEDDED_COMPACTION_TIMEOUT_MS,
+        timeoutMs: compactionTimeoutMs,
       }),
     });
     try {
@@ -908,9 +947,32 @@ export async function compactEmbeddedPiSessionDirect(
           // If token estimation throws on a malformed message, fall back to 0 so
           // the sanity check below becomes a no-op instead of crashing compaction.
         }
-        const result = await compactWithSafetyTimeout(() =>
-          session.compact(params.customInstructions),
+        const result = await compactWithSafetyTimeout(
+          () => session.compact(params.customInstructions),
+          compactionTimeoutMs,
+          {
+            abortSignal: params.abortSignal,
+            onCancel: () => {
+              session.abortCompaction();
+            },
+          },
         );
+        // Re-run tool_use/tool_result pairing repair after compaction.
+        // Compaction can remove assistant messages containing tool_use blocks
+        // while leaving orphaned tool_result blocks behind, which causes
+        // Anthropic API 400 errors: "unexpected tool_use_id found in tool_result blocks".
+        // See: https://github.com/openclaw/openclaw/issues/15691
+        if (transcriptPolicy.repairToolUseResultPairing) {
+          const postCompactRepair = repairToolUseResultPairing(session.messages);
+          if (postCompactRepair.droppedOrphanCount > 0 || postCompactRepair.moved) {
+            session.agent.replaceMessages(postCompactRepair.messages);
+            log.info(
+              `[compaction] post-compact repair: dropped ${postCompactRepair.droppedOrphanCount} orphaned tool_result(s), ` +
+                `${postCompactRepair.droppedDuplicateCount} duplicate(s) ` +
+                `(sessionKey=${params.sessionKey ?? params.sessionId})`,
+            );
+          }
+        }
         await runPostCompactionSideEffects({
           config: params.config,
           sessionKey: params.sessionKey,
@@ -1047,6 +1109,7 @@ export async function compactEmbeddedPiSession(
       ensureRuntimePluginsLoaded({
         config: params.config,
         workspaceDir: params.workspaceDir,
+        allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
       });
       ensureContextEnginesInitialized();
       const contextEngine = await resolveContextEngine(params.config);
@@ -1057,7 +1120,12 @@ export async function compactEmbeddedPiSession(
         const ceProvider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
         const ceModelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
         const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
-        const { model: ceModel } = resolveModel(ceProvider, ceModelId, agentDir, params.config);
+        const { model: ceModel } = await resolveModelAsync(
+          ceProvider,
+          ceModelId,
+          agentDir,
+          params.config,
+        );
         const ceCtxInfo = resolveContextWindowInfo({
           cfg: params.config,
           provider: ceProvider,

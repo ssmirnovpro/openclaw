@@ -180,6 +180,7 @@ const voiceCallPlugin = {
         runtimePromise = createVoiceCallRuntime({
           config,
           coreConfig: api.config as CoreConfig,
+          agentRuntime: api.runtime.agent,
           ttsRuntime: api.runtime.tts,
           logger: api.logger,
         });
@@ -230,7 +231,9 @@ const voiceCallPlugin = {
     const respondToCallMessageAction = async (params: {
       requestParams: GatewayRequestHandlerOptions["params"];
       respond: GatewayRequestHandlerOptions["respond"];
-      action: (request: Awaited<ReturnType<typeof resolveCallMessageRequest>>) => Promise<{
+      action: (
+        request: Exclude<Awaited<ReturnType<typeof resolveCallMessageRequest>>, { error: string }>,
+      ) => Promise<{
         success: boolean;
         error?: string;
         transcript?: string;
