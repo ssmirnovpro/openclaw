@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createStartAccountContext } from "../../test-utils/start-account-context.js";
+import { createStartAccountContext } from "../../../test/helpers/extensions/start-account-context.js";
 import {
   expectStopPendingUntilAbort,
   startAccountAndTrackLifecycle,
-} from "../../test-utils/start-account-lifecycle.js";
+  waitForStartedMocks,
+} from "../../../test/helpers/extensions/start-account-lifecycle.js";
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 
 const hoisted = vi.hoisted(() => ({
@@ -49,10 +50,7 @@ describe("nextcloudTalkPlugin gateway.startAccount", () => {
       account: buildAccount(),
     });
     await expectStopPendingUntilAbort({
-      waitForStarted: () =>
-        vi.waitFor(() => {
-          expect(hoisted.monitorNextcloudTalkProvider).toHaveBeenCalledOnce();
-        }),
+      waitForStarted: waitForStartedMocks(hoisted.monitorNextcloudTalkProvider),
       isSettled,
       abort,
       task,
