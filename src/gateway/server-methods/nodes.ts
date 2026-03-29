@@ -539,7 +539,7 @@ export const nodeHandlers: GatewayRequestHandlers = {
       respond(true, list, undefined);
     });
   },
-  "node.pair.approve": async ({ params, respond, context }) => {
+  "node.pair.approve": async ({ params, respond, context, client }) => {
     if (!validateNodePairApproveParams(params)) {
       respondInvalidParams({
         respond,
@@ -549,17 +549,32 @@ export const nodeHandlers: GatewayRequestHandlers = {
       return;
     }
     const { requestId } = params as { requestId: string };
+    // Intentionally fail closed for RPC callers without an explicit scoped session.
+    const callerScopes = Array.isArray(client?.connect?.scopes) ? client.connect.scopes : [];
     await respondUnavailableOnThrow(respond, async () => {
-      const approved = await approveNodePairing(requestId);
+      const approved = await approveNodePairing(requestId, { callerScopes });
       if (!approved) {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown requestId"));
         return;
       }
+      if ("status" in approved && approved.status === "forbidden") {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, `missing scope: ${approved.missingScope}`),
+        );
+        return;
+      }
+      if (!("node" in approved)) {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown requestId"));
+        return;
+      }
+      const approvedNode = approved.node;
       context.broadcast(
         "node.pair.resolved",
         {
           requestId,
-          nodeId: approved.node.nodeId,
+          nodeId: approvedNode.nodeId,
           decision: "approved",
           ts: Date.now(),
         },
@@ -665,12 +680,15 @@ export const nodeHandlers: GatewayRequestHandlers = {
               version: undefined,
               coreVersion: undefined,
               uiVersion: undefined,
+              clientId: entry.clientId,
+              clientMode: entry.clientMode,
               deviceFamily: undefined,
               modelIdentifier: undefined,
               remoteIp: entry.remoteIp,
               caps: [],
               commands: [],
               permissions: undefined,
+              approvedAtMs: entry.approvedAtMs,
             },
           ]),
       );
@@ -692,6 +710,8 @@ export const nodeHandlers: GatewayRequestHandlers = {
           version: live?.version ?? paired?.version,
           coreVersion: live?.coreVersion ?? paired?.coreVersion,
           uiVersion: live?.uiVersion ?? paired?.uiVersion,
+          clientId: live?.clientId ?? paired?.clientId,
+          clientMode: live?.clientMode ?? paired?.clientMode,
           deviceFamily: live?.deviceFamily ?? paired?.deviceFamily,
           modelIdentifier: live?.modelIdentifier ?? paired?.modelIdentifier,
           remoteIp: live?.remoteIp ?? paired?.remoteIp,
@@ -700,6 +720,7 @@ export const nodeHandlers: GatewayRequestHandlers = {
           pathEnv: live?.pathEnv,
           permissions: live?.permissions ?? paired?.permissions,
           connectedAtMs: live?.connectedAtMs,
+          approvedAtMs: paired?.approvedAtMs,
           paired: Boolean(paired),
           connected: Boolean(live),
         };
@@ -762,6 +783,8 @@ export const nodeHandlers: GatewayRequestHandlers = {
           version: live?.version,
           coreVersion: live?.coreVersion,
           uiVersion: live?.uiVersion,
+          clientId: live?.clientId ?? paired?.clientId,
+          clientMode: live?.clientMode ?? paired?.clientMode,
           deviceFamily: live?.deviceFamily,
           modelIdentifier: live?.modelIdentifier,
           remoteIp: live?.remoteIp ?? paired?.remoteIp,
@@ -770,6 +793,7 @@ export const nodeHandlers: GatewayRequestHandlers = {
           pathEnv: live?.pathEnv,
           permissions: live?.permissions,
           connectedAtMs: live?.connectedAtMs,
+          approvedAtMs: paired?.approvedAtMs,
           paired: Boolean(paired),
           connected: Boolean(live),
         },
