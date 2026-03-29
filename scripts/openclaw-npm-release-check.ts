@@ -18,26 +18,36 @@ type PackageJson = {
 
 export type ParsedReleaseVersion = {
   version: string;
+  baseVersion: string;
   channel: "stable" | "beta";
   year: number;
   month: number;
   day: number;
   betaNumber?: number;
+  correctionNumber?: number;
   date: Date;
 };
 
 export type ParsedReleaseTag = {
   version: string;
   packageVersion: string;
+  baseVersion: string;
   channel: "stable" | "beta";
   correctionNumber?: number;
   date: Date;
 };
 
+export type NpmPublishPlan = {
+  channel: "stable" | "beta";
+  publishTag: "latest" | "beta";
+  mirrorDistTags: ("latest" | "beta")[];
+};
+
 const STABLE_VERSION_REGEX = /^(?<year>\d{4})\.(?<month>[1-9]\d?)\.(?<day>[1-9]\d?)$/;
 const BETA_VERSION_REGEX =
   /^(?<year>\d{4})\.(?<month>[1-9]\d?)\.(?<day>[1-9]\d?)-beta\.(?<beta>[1-9]\d*)$/;
-const CORRECTION_TAG_REGEX = /^(?<base>\d{4}\.[1-9]\d?\.[1-9]\d?)-(?<correction>[1-9]\d*)$/;
+const CORRECTION_VERSION_REGEX =
+  /^(?<year>\d{4})\.(?<month>[1-9]\d?)\.(?<day>[1-9]\d?)-(?<correction>[1-9]\d*)$/;
 const EXPECTED_REPOSITORY_URL = "https://github.com/openclaw/openclaw";
 const MAX_CALVER_DISTANCE_DAYS = 2;
 const REQUIRED_PACKED_PATHS = ["dist/control-ui/index.html"];
@@ -92,6 +102,7 @@ function parseDateParts(
 
   return {
     version,
+    baseVersion: `${year}.${month}.${day}`,
     channel,
     year,
     month,
@@ -117,7 +128,83 @@ export function parseReleaseVersion(version: string): ParsedReleaseVersion | nul
     return parseDateParts(trimmed, betaMatch.groups, "beta");
   }
 
+  const correctionMatch = CORRECTION_VERSION_REGEX.exec(trimmed);
+  if (correctionMatch?.groups) {
+    const parsedCorrection = parseDateParts(trimmed, correctionMatch.groups, "stable");
+    const correctionNumber = Number.parseInt(correctionMatch.groups.correction ?? "", 10);
+    if (parsedCorrection === null || !Number.isInteger(correctionNumber) || correctionNumber < 1) {
+      return null;
+    }
+
+    return {
+      ...parsedCorrection,
+      correctionNumber,
+    };
+  }
+
   return null;
+}
+
+export function compareReleaseVersions(left: string, right: string): number | null {
+  const parsedLeft = parseReleaseVersion(left);
+  const parsedRight = parseReleaseVersion(right);
+  if (parsedLeft === null || parsedRight === null) {
+    return null;
+  }
+
+  const dateDelta = parsedLeft.date.getTime() - parsedRight.date.getTime();
+  if (dateDelta !== 0) {
+    return Math.sign(dateDelta);
+  }
+
+  if (parsedLeft.channel !== parsedRight.channel) {
+    return parsedLeft.channel === "stable" ? 1 : -1;
+  }
+
+  if (parsedLeft.channel === "beta" && parsedRight.channel === "beta") {
+    return Math.sign((parsedLeft.betaNumber ?? 0) - (parsedRight.betaNumber ?? 0));
+  }
+
+  return Math.sign((parsedLeft.correctionNumber ?? 0) - (parsedRight.correctionNumber ?? 0));
+}
+
+export function resolveNpmPublishPlan(
+  version: string,
+  currentBetaVersion?: string | null,
+): NpmPublishPlan {
+  const parsedVersion = parseReleaseVersion(version);
+  if (parsedVersion === null) {
+    throw new Error(`Unsupported release version "${version}".`);
+  }
+
+  if (parsedVersion.channel === "beta") {
+    return {
+      channel: "beta",
+      publishTag: "beta",
+      mirrorDistTags: [],
+    };
+  }
+
+  const normalizedCurrentBeta = currentBetaVersion?.trim();
+  if (normalizedCurrentBeta) {
+    const betaVsStable = compareReleaseVersions(normalizedCurrentBeta, version);
+    if (betaVsStable !== null && betaVsStable > 0) {
+      return {
+        channel: "stable",
+        publishTag: "latest",
+        // Keep beta on the newer prerelease train when one already exists.
+        mirrorDistTags: [],
+      };
+    }
+  }
+
+  return {
+    channel: "stable",
+    publishTag: "latest",
+    // Stable promotion keeps beta aligned unless beta already points at a
+    // newer prerelease train.
+    mirrorDistTags: ["beta"],
+  };
 }
 
 export function parseReleaseTagVersion(version: string): ParsedReleaseTag | null {
@@ -131,36 +218,14 @@ export function parseReleaseTagVersion(version: string): ParsedReleaseTag | null
     return {
       version: trimmed,
       packageVersion: parsedVersion.version,
+      baseVersion: parsedVersion.baseVersion,
       channel: parsedVersion.channel,
       date: parsedVersion.date,
-      correctionNumber: undefined,
+      correctionNumber: parsedVersion.correctionNumber,
     };
   }
 
-  const correctionMatch = CORRECTION_TAG_REGEX.exec(trimmed);
-  if (!correctionMatch?.groups) {
-    return null;
-  }
-
-  const baseVersion = correctionMatch.groups.base ?? "";
-  const parsedBaseVersion = parseReleaseVersion(baseVersion);
-  const correctionNumber = Number.parseInt(correctionMatch.groups.correction ?? "", 10);
-  if (
-    parsedBaseVersion === null ||
-    parsedBaseVersion.channel !== "stable" ||
-    !Number.isInteger(correctionNumber) ||
-    correctionNumber < 1
-  ) {
-    return null;
-  }
-
-  return {
-    version: trimmed,
-    packageVersion: parsedBaseVersion.version,
-    channel: "stable",
-    correctionNumber,
-    date: parsedBaseVersion.date,
-  };
+  return null;
 }
 
 function startOfUtcDay(date: Date): number {
@@ -198,9 +263,9 @@ export function collectReleasePackageMetadataErrors(pkg: PackageJson): string[] 
       `package.json bin.openclaw must be "openclaw.mjs"; found "${pkg.bin?.openclaw ?? ""}".`,
     );
   }
-  if (pkg.peerDependencies?.["node-llama-cpp"] !== "3.16.2") {
+  if (pkg.peerDependencies?.["node-llama-cpp"] !== "3.18.1") {
     errors.push(
-      `package.json peerDependencies["node-llama-cpp"] must be "3.16.2"; found "${
+      `package.json peerDependencies["node-llama-cpp"] must be "3.18.1"; found "${
         pkg.peerDependencies?.["node-llama-cpp"] ?? ""
       }".`,
     );
@@ -227,7 +292,7 @@ export function collectReleaseTagErrors(params: {
   const parsedVersion = parseReleaseVersion(packageVersion);
   if (parsedVersion === null) {
     errors.push(
-      `package.json version must match YYYY.M.D or YYYY.M.D-beta.N; found "${packageVersion || "<missing>"}".`,
+      `package.json version must match YYYY.M.D, YYYY.M.D-N, or YYYY.M.D-beta.N; found "${packageVersion || "<missing>"}".`,
     );
   }
 
@@ -244,17 +309,24 @@ export function collectReleaseTagErrors(params: {
   }
 
   const expectedTag = packageVersion ? `v${packageVersion}` : "<missing>";
-  const expectedCorrectionTag = parsedVersion?.channel === "stable" ? `${expectedTag}-N` : null;
   const matchesExpectedTag =
     parsedTag !== null &&
     parsedVersion !== null &&
-    parsedTag.packageVersion === parsedVersion.version &&
-    parsedTag.channel === parsedVersion.channel;
+    parsedTag.channel === parsedVersion.channel &&
+    (parsedTag.packageVersion === parsedVersion.version ||
+      (parsedVersion.channel === "stable" &&
+        parsedVersion.correctionNumber === undefined &&
+        parsedTag.correctionNumber !== undefined &&
+        parsedTag.baseVersion === parsedVersion.baseVersion));
   if (!matchesExpectedTag) {
     errors.push(
       `Release tag ${releaseTag || "<missing>"} does not match package.json version ${
         packageVersion || "<missing>"
-      }; expected ${expectedCorrectionTag ? `${expectedTag} or ${expectedCorrectionTag}` : expectedTag}.`,
+      }; expected ${
+        parsedVersion?.channel === "stable" && parsedVersion.correctionNumber === undefined
+          ? `${expectedTag} or ${expectedTag}-N`
+          : expectedTag
+      }.`,
     );
   }
 
@@ -414,23 +486,25 @@ function collectPackedTarballErrors(): string[] {
   const errors: string[] = [];
   let stdout = "";
   try {
-    stdout = runNpmCommand(["pack", "--json", "--dry-run"]);
+    stdout = runNpmCommand(["pack", "--json", "--dry-run", "--ignore-scripts"]);
   } catch (error) {
     const message = describeExecFailure(error);
     errors.push(
-      `Failed to inspect npm tarball contents via \`npm pack --json --dry-run\`: ${message}`,
+      `Failed to inspect npm tarball contents via \`npm pack --json --dry-run --ignore-scripts\`: ${message}`,
     );
     return errors;
   }
 
   const packResults = parseNpmPackJsonOutput(stdout);
   if (!packResults) {
-    errors.push("Failed to parse JSON output from `npm pack --json --dry-run`.");
+    errors.push("Failed to parse JSON output from `npm pack --json --dry-run --ignore-scripts`.");
     return errors;
   }
   const firstResult = packResults[0];
   if (!firstResult || !Array.isArray(firstResult.files)) {
-    errors.push("`npm pack --json --dry-run` did not return a files list to validate.");
+    errors.push(
+      "`npm pack --json --dry-run --ignore-scripts` did not return a files list to validate.",
+    );
     return errors;
   }
 
