@@ -76,20 +76,6 @@
 - README (GitHub): keep absolute docs URLs (`https://docs.openclaw.ai/...`) so links work on GitHub.
 - Docs content must be generic: no personal device names/hostnames/paths; use placeholders like `user@gateway-host` and “gateway host”.
 
-## Internal Development Docs
-
-- `docs/internal/**` is for internal-only development context that should stay in the repo but not on the public docs site.
-- Automatically create or update a note in `docs/internal/<github-username>/` when starting meaningful implementation work, refactors, migrations, architecture changes, or other development context that would otherwise be lost.
-- Default note types include implementation plans, refactor plans, migration plans, architecture notes, debugging notes, and other development context.
-- Infer `<github-username>` from the current authenticated GitHub user. Prefer the active GitHub login; if that cannot be resolved, fall back to the best available local git identity.
-- Use dated filenames: `YYYY-MM-DD-short-topic.md`.
-- Use YAML frontmatter at minimum: `title`, `summary`, `author`, `github_username`, and `created`.
-- When the author identity is known, prefer `author: "Name <email>"`.
-- Keep these notes in plain language.
-- Avoid deleting or rewriting someone else's internal notes unless there is a clear valid reason, such as an explicit user request, accidental duplicate content, secret removal, replacement by a newer note, or override by BDFL.
-- Do not place internal planning notes in public `docs/**` pages or revive `experiments/`; use `docs/internal/` instead.
-- Read `docs/internal/README.md` before creating or reorganizing internal development notes.
-
 ## Docs i18n (zh-CN)
 
 - `docs/zh-CN/**` is generated; do not edit unless the user explicitly asks.
@@ -126,6 +112,7 @@
 - Type-check/build: `pnpm build`
 - TypeScript checks: `pnpm tsgo`
 - Lint/format: `pnpm check`
+- Local agent/dev shells default to lower-memory `OPENCLAW_LOCAL_CHECK=1` behavior for `pnpm tsgo` and `pnpm lint`; set `OPENCLAW_LOCAL_CHECK=0` in CI/shared runs.
 - Format check: `pnpm format` (oxfmt --check)
 - Format fix: `pnpm format:fix` (oxfmt --write)
 - Terminology:
@@ -193,6 +180,10 @@
 - When tests need example Anthropic/OpenAI model constants, prefer `sonnet-4.6` and `gpt-5.4`; update older Anthropic/GPT examples when you touch those tests.
 - Run `pnpm test` (or `pnpm test:coverage`) before pushing when you touch logic.
 - Write tests to clean up timers, env, globals, mocks, sockets, temp dirs, and module state so `--isolate=false` stays green.
+- Test performance guardrail: do not put `vi.resetModules()` plus `await import(...)` in `beforeEach`/per-test loops for heavy modules unless module state truly requires it. Prefer static imports or one-time `beforeAll` imports, then reset mocks/runtime state directly.
+- Test performance guardrail: inside an extension package, prefer a thin local seam (`./api.ts`, `./runtime-api.ts`, or a narrower local `*.runtime-api.ts`) over direct `openclaw/plugin-sdk/*` imports for internal production code. Keep local seams curated and lightweight; only reach for direct `plugin-sdk/*` imports when you are crossing a real package boundary or when no suitable local seam exists yet.
+- Test performance guardrail: keep expensive runtime fallback work such as snapshotting, migration, installs, or bootstrap behind dedicated `*.runtime.ts` boundaries so tests can mock the seam instead of accidentally invoking real work.
+- Test performance guardrail: for import-only/runtime-wrapper tests, keep the wrapper lazy. Do not eagerly load heavy verification/bootstrap/runtime modules at module top level if the exported function can import them on demand.
 - Agents MUST NOT modify baseline, inventory, ignore, snapshot, or expected-failure files to silence failing checks without explicit approval in this chat.
 - For targeted/local debugging, keep using the wrapper: `pnpm test -- <path-or-filter> [vitest args...]` (for example `pnpm test -- src/commands/onboard-search.test.ts -t "shows registered plugin providers"`); do not default to raw `pnpm vitest run ...` because it bypasses wrapper config/profile/pool routing.
 - Do not set test workers above 16; tried already.
