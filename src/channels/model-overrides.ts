@@ -1,5 +1,4 @@
 import type { OpenClawConfig } from "../config/config.js";
-import { parseFeishuConversationId } from "../plugin-sdk/feishu-conversation.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
 import {
   buildChannelKeyCandidates,
@@ -59,10 +58,10 @@ function buildChannelCandidates(
     normalizeMessageChannel(params.channel ?? "") ?? params.channel?.trim().toLowerCase();
   const groupId = params.groupId?.trim();
   const sessionConversation = resolveSessionConversationRef(params.parentSessionKey);
-  const bundledParentOverrideFallbacks = resolveBundledParentOverrideFallbacks({
-    channel: normalizedChannel,
-    parentConversationId: sessionConversation?.rawId,
-  });
+  const feishuParentOverrideFallbacks =
+    normalizedChannel === "feishu"
+      ? buildFeishuParentOverrideCandidates(sessionConversation?.rawId)
+      : [];
   const parentOverrideFallbacks =
     (normalizedChannel
       ? getChannelPlugin(
@@ -70,7 +69,7 @@ function buildChannelCandidates(
         )?.conversationBindings?.buildModelOverrideParentCandidates?.({
           parentConversationId: sessionConversation?.rawId,
         })
-      : null) ?? bundledParentOverrideFallbacks;
+      : null) ?? [];
   const groupConversationKind =
     normalizeChatType(params.groupChatType ?? undefined) === "channel"
       ? "channel"
@@ -95,6 +94,7 @@ function buildChannelCandidates(
       sessionConversation?.rawId,
       ...(groupConversation?.parentConversationCandidates ?? []),
       ...(sessionConversation?.parentConversationCandidates ?? []),
+      ...feishuParentOverrideFallbacks,
       ...parentOverrideFallbacks,
     ),
     parentKeys: buildChannelKeyCandidates(
@@ -108,32 +108,33 @@ function buildChannelCandidates(
   };
 }
 
-function resolveBundledParentOverrideFallbacks(params: {
-  channel?: string | null;
-  parentConversationId?: string | null;
-}): string[] {
-  if (params.channel !== "feishu") {
+function buildFeishuParentOverrideCandidates(rawId: string | undefined): string[] {
+  const value = rawId?.trim();
+  if (!value) {
     return [];
   }
-  const parsed = parseFeishuConversationId({
-    conversationId: params.parentConversationId ?? "",
-  });
-  if (!parsed) {
-    return [];
+  const topicSenderMatch = value.match(/^(.+):topic:([^:]+):sender:([^:]+)$/i);
+  if (topicSenderMatch) {
+    const chatId = topicSenderMatch[1]?.trim().toLowerCase();
+    const topicId = topicSenderMatch[2]?.trim().toLowerCase();
+    return [`${chatId}:topic:${topicId}`, chatId].filter((entry): entry is string =>
+      Boolean(entry),
+    );
   }
-  switch (parsed.scope) {
-    case "group_topic_sender":
-      return buildChannelKeyCandidates(
-        parsed.topicId ? `${parsed.chatId}:topic:${parsed.topicId}` : undefined,
-        parsed.chatId,
-      );
-    case "group_topic":
-    case "group_sender":
-      return buildChannelKeyCandidates(parsed.chatId);
-    case "group":
-    default:
-      return [];
+  const topicMatch = value.match(/^(.+):topic:([^:]+)$/i);
+  if (topicMatch) {
+    const chatId = topicMatch[1]?.trim().toLowerCase();
+    const topicId = topicMatch[2]?.trim().toLowerCase();
+    return [`${chatId}:topic:${topicId}`, chatId].filter((entry): entry is string =>
+      Boolean(entry),
+    );
   }
+  const senderMatch = value.match(/^(.+):sender:([^:]+)$/i);
+  if (senderMatch) {
+    const chatId = senderMatch[1]?.trim().toLowerCase();
+    return chatId ? [chatId] : [];
+  }
+  return [];
 }
 
 export function resolveChannelModelOverride(
