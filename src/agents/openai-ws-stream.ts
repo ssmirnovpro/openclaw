@@ -21,6 +21,7 @@
  * @see src/agents/openai-ws-connection.ts for the connection manager
  */
 
+import { randomUUID } from "node:crypto";
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type {
   AssistantMessage,
@@ -29,6 +30,11 @@ import type {
   StopReason,
 } from "@mariozechner/pi-ai";
 import * as piAi from "@mariozechner/pi-ai";
+import {
+  resolveProviderTransportTurnStateWithPlugin,
+  resolveProviderWebSocketSessionPolicyWithPlugin,
+} from "../plugins/provider-runtime.js";
+import type { ProviderRuntimeModel, ProviderTransportTurnState } from "../plugins/types.js";
 import {
   getOpenAIWebSocketErrorDetails,
   OpenAIWebSocketManager,
@@ -43,10 +49,14 @@ import {
 } from "./openai-ws-message-conversion.js";
 import { buildOpenAIWebSocketResponseCreatePayload } from "./openai-ws-request.js";
 import { log } from "./pi-embedded-runner/logger.js";
+import { normalizeProviderId } from "./provider-id.js";
+import { createBoundaryAwareStreamFnForModel } from "./provider-transport-stream.js";
 import {
   buildAssistantMessageWithZeroUsage,
   buildStreamErrorAssistantMessage,
 } from "./stream-message-shared.js";
+import { stripSystemPromptCacheBoundary } from "./system-prompt-cache-boundary.js";
+import { mergeTransportMetadata } from "./transport-stream-shared.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-session state
@@ -62,6 +72,9 @@ interface WsSession {
   warmUpAttempted: boolean;
   /** True if the session is permanently broken (no more reconnect). */
   broken: boolean;
+  /** Session-scoped cool-down after repeated websocket failures. */
+  degradedUntil: number | null;
+  degradeCooldownMs: number;
 }
 
 /** Module-level registry: sessionId → WsSession */
@@ -69,11 +82,13 @@ const wsRegistry = new Map<string, WsSession>();
 
 type OpenAIWsStreamDeps = {
   createManager: (options?: OpenAIWebSocketManagerOptions) => OpenAIWebSocketManager;
+  createHttpFallbackStreamFn: (model: ProviderRuntimeModel) => StreamFn | undefined;
   streamSimple: typeof piAi.streamSimple;
 };
 
 const defaultOpenAIWsStreamDeps: OpenAIWsStreamDeps = {
   createManager: (options) => new OpenAIWebSocketManager(options),
+  createHttpFallbackStreamFn: (model) => createBoundaryAwareStreamFnForModel(model),
   streamSimple: (...args) => piAi.streamSimple(...args),
 };
 
@@ -208,6 +223,8 @@ export interface OpenAIWebSocketStreamOptions {
 type WsTransport = "sse" | "websocket" | "auto";
 const WARM_UP_TIMEOUT_MS = 8_000;
 const MAX_AUTO_WS_RUNTIME_RETRIES = 1;
+const DEFAULT_WS_DEGRADE_COOLDOWN_MS = 60_000;
+let wsDegradeCooldownMsOverride: number | undefined;
 
 class OpenAIWebSocketRuntimeError extends Error {
   readonly kind: "disconnect" | "send" | "server";
@@ -247,13 +264,235 @@ function resolveWsWarmup(options: Parameters<StreamFn>[2]): boolean {
   return warmup === true;
 }
 
-function resetWsSession(params: { sessionId: string; session: WsSession }): void {
+function resetWsSession(params: {
+  session: WsSession;
+  createManager: () => OpenAIWebSocketManager;
+  preserveDegradeUntil?: boolean;
+}): void {
   try {
     params.session.manager.close();
   } catch {
     /* ignore */
   }
-  wsRegistry.delete(params.sessionId);
+  params.session.manager = params.createManager();
+  params.session.everConnected = false;
+  params.session.warmUpAttempted = false;
+  params.session.broken = false;
+  if (!params.preserveDegradeUntil) {
+    params.session.degradedUntil = null;
+  }
+}
+
+function markWsSessionDegraded(session: WsSession): void {
+  session.degradedUntil = Date.now() + session.degradeCooldownMs;
+}
+
+function isWsSessionDegraded(session: WsSession): boolean {
+  if (!session.degradedUntil) {
+    return false;
+  }
+  if (session.degradedUntil <= Date.now()) {
+    session.degradedUntil = null;
+    return false;
+  }
+  return true;
+}
+
+function createWsManager(
+  managerOptions: OpenAIWebSocketManagerOptions | undefined,
+  sessionHeaders?: Record<string, string>,
+): OpenAIWebSocketManager {
+  return openAIWsStreamDeps.createManager({
+    ...managerOptions,
+    ...(sessionHeaders
+      ? {
+          headers: {
+            ...managerOptions?.headers,
+            ...sessionHeaders,
+          },
+        }
+      : {}),
+  });
+}
+
+const AZURE_OPENAI_PROVIDER_IDS = new Set(["azure-openai", "azure-openai-responses"]);
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+
+function isOpenAIApiBaseUrl(baseUrl?: string): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    const url = new URL(trimmed);
+    return (
+      url.protocol === "https:" &&
+      url.hostname.toLowerCase() === "api.openai.com" &&
+      /^\/v1\/?$/u.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOpenAICodexBaseUrl(baseUrl?: string): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return /^https?:\/\/chatgpt\.com\/backend-api\/?$/iu.test(trimmed);
+}
+
+function isAzureOpenAIBaseUrl(baseUrl?: string): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  try {
+    return new URL(trimmed).hostname.toLowerCase().endsWith(".openai.azure.com");
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTransportIdentityValue(value: string, maxLength = 160): string {
+  const trimmed = value.trim().replace(/[\r\n]+/gu, " ");
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+function usesNativeOpenAIRoute(provider: string, baseUrl?: string): boolean {
+  const normalizedProvider = normalizeProviderId(provider);
+  if (!normalizedProvider) {
+    return false;
+  }
+  if (normalizedProvider === "openai") {
+    return !baseUrl || isOpenAIApiBaseUrl(baseUrl);
+  }
+  if (AZURE_OPENAI_PROVIDER_IDS.has(normalizedProvider)) {
+    return !baseUrl || isAzureOpenAIBaseUrl(baseUrl);
+  }
+  if (normalizedProvider === OPENAI_CODEX_PROVIDER_ID) {
+    return !baseUrl || isOpenAIApiBaseUrl(baseUrl) || isOpenAICodexBaseUrl(baseUrl);
+  }
+  return false;
+}
+
+function resolveNativeOpenAISessionHeaders(params: {
+  provider: string;
+  baseUrl?: string;
+  sessionId?: string;
+}): Record<string, string> | undefined {
+  if (!params.sessionId || !usesNativeOpenAIRoute(params.provider, params.baseUrl)) {
+    return undefined;
+  }
+  const sessionId = normalizeTransportIdentityValue(params.sessionId);
+  if (!sessionId) {
+    return undefined;
+  }
+  return {
+    "x-client-request-id": sessionId,
+    "x-openclaw-session-id": sessionId,
+  };
+}
+
+function resolveNativeOpenAITransportTurnState(params: {
+  provider: string;
+  baseUrl?: string;
+  sessionId?: string;
+  turnId: string;
+  attempt: number;
+  transport: "stream" | "websocket";
+}): ProviderTransportTurnState | undefined {
+  const sessionHeaders = resolveNativeOpenAISessionHeaders({
+    provider: params.provider,
+    baseUrl: params.baseUrl,
+    sessionId: params.sessionId,
+  });
+  if (!sessionHeaders) {
+    return undefined;
+  }
+  const turnId = normalizeTransportIdentityValue(params.turnId);
+  const attempt = String(Math.max(1, params.attempt));
+  return {
+    headers: {
+      ...sessionHeaders,
+      "x-openclaw-turn-id": turnId,
+      "x-openclaw-turn-attempt": attempt,
+    },
+    metadata: {
+      openclaw_session_id: sessionHeaders["x-openclaw-session-id"] ?? "",
+      openclaw_turn_id: turnId,
+      openclaw_turn_attempt: attempt,
+      openclaw_transport: params.transport,
+    },
+  };
+}
+
+function resolveProviderTransportTurnState(
+  model: Parameters<StreamFn>[0],
+  params: {
+    sessionId?: string;
+    turnId: string;
+    attempt: number;
+    transport: "stream" | "websocket";
+  },
+): ProviderTransportTurnState | undefined {
+  if (usesNativeOpenAIRoute(model.provider, (model as { baseUrl?: string }).baseUrl)) {
+    return resolveNativeOpenAITransportTurnState({
+      provider: model.provider,
+      baseUrl: (model as { baseUrl?: string }).baseUrl,
+      sessionId: params.sessionId,
+      turnId: params.turnId,
+      attempt: params.attempt,
+      transport: params.transport,
+    });
+  }
+  return (
+    resolveProviderTransportTurnStateWithPlugin({
+      provider: model.provider,
+      context: {
+        provider: model.provider,
+        modelId: model.id,
+        model: model as ProviderRuntimeModel,
+        sessionId: params.sessionId,
+        turnId: params.turnId,
+        attempt: params.attempt,
+        transport: params.transport,
+      },
+    }) ?? undefined
+  );
+}
+
+function resolveWebSocketSessionPolicy(
+  model: Parameters<StreamFn>[0],
+  sessionId: string,
+): { headers?: Record<string, string>; degradeCooldownMs: number } {
+  if (usesNativeOpenAIRoute(model.provider, (model as { baseUrl?: string }).baseUrl)) {
+    return {
+      headers: resolveNativeOpenAISessionHeaders({
+        provider: model.provider,
+        baseUrl: (model as { baseUrl?: string }).baseUrl,
+        sessionId,
+      }),
+      degradeCooldownMs: Math.max(0, wsDegradeCooldownMsOverride ?? DEFAULT_WS_DEGRADE_COOLDOWN_MS),
+    };
+  }
+  const policy = resolveProviderWebSocketSessionPolicyWithPlugin({
+    provider: model.provider,
+    context: {
+      provider: model.provider,
+      modelId: model.id,
+      model: model as ProviderRuntimeModel,
+      sessionId,
+    },
+  });
+  return {
+    headers: policy?.headers,
+    degradeCooldownMs: Math.max(
+      0,
+      wsDegradeCooldownMsOverride ?? policy?.degradeCooldownMs ?? DEFAULT_WS_DEGRADE_COOLDOWN_MS,
+    ),
+  };
 }
 
 function formatOpenAIWebSocketError(
@@ -311,6 +550,7 @@ async function runWarmUp(params: {
   modelId: string;
   tools: FunctionToolDefinition[];
   instructions?: string;
+  metadata?: Record<string, string>;
   signal?: AbortSignal;
 }): Promise<void> {
   if (params.signal?.aborted) {
@@ -358,6 +598,7 @@ async function runWarmUp(params: {
       model: params.modelId,
       tools: params.tools.length > 0 ? params.tools : undefined,
       instructions: params.instructions,
+      ...(params.metadata ? { metadata: params.metadata } : {}),
     });
   });
 }
@@ -392,34 +633,55 @@ export function createOpenAIWebSocketStreamFn(
       const signal = opts.signal ?? (options as WsOptions | undefined)?.signal;
       let emittedStart = false;
       let runtimeRetries = 0;
+      const turnId = randomUUID();
+      let turnAttempt = 0;
+      const wsSessionPolicy = resolveWebSocketSessionPolicy(model, sessionId);
+      const sessionHeaders = wsSessionPolicy.headers;
 
       while (true) {
         let session = wsRegistry.get(sessionId);
         if (!session) {
-          const manager = openAIWsStreamDeps.createManager(opts.managerOptions);
+          const manager = createWsManager(opts.managerOptions, sessionHeaders);
           session = {
             manager,
             lastContextLength: 0,
             everConnected: false,
             warmUpAttempted: false,
             broken: false,
+            degradedUntil: null,
+            degradeCooldownMs: wsSessionPolicy.degradeCooldownMs,
           };
           wsRegistry.set(sessionId, session);
+        }
+
+        if (transport !== "websocket" && isWsSessionDegraded(session)) {
+          log.debug(
+            `[ws-stream] session=${sessionId} in websocket cool-down; using HTTP fallback until ${new Date(session.degradedUntil!).toISOString()}`,
+          );
+          return fallbackToHttp(model, context, options, apiKey, eventStream, opts.signal, {
+            suppressStart: emittedStart,
+            turnState: resolveProviderTransportTurnState(model, {
+              sessionId,
+              turnId,
+              attempt: Math.max(1, turnAttempt),
+              transport: "stream",
+            }),
+          });
         }
 
         if (!session.manager.isConnected() && !session.broken) {
           try {
             await session.manager.connect(apiKey);
             session.everConnected = true;
+            session.degradedUntil = null;
             log.debug(`[ws-stream] connected for session=${sessionId}`);
           } catch (connErr) {
-            try {
-              session.manager.close();
-            } catch {
-              /* ignore */
-            }
-            session.broken = true;
-            wsRegistry.delete(sessionId);
+            markWsSessionDegraded(session);
+            resetWsSession({
+              session,
+              createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+              preserveDegradeUntil: true,
+            });
             if (transport === "websocket") {
               throw connErr instanceof Error ? connErr : new Error(String(connErr));
             }
@@ -428,6 +690,12 @@ export function createOpenAIWebSocketStreamFn(
             );
             return fallbackToHttp(model, context, options, apiKey, eventStream, opts.signal, {
               suppressStart: emittedStart,
+              turnState: resolveProviderTransportTurnState(model, {
+                sessionId,
+                turnId,
+                attempt: Math.max(1, turnAttempt),
+                transport: "stream",
+              }),
             });
           }
         }
@@ -437,9 +705,20 @@ export function createOpenAIWebSocketStreamFn(
             throw new Error("WebSocket session disconnected");
           }
           log.warn(`[ws-stream] session=${sessionId} broken/disconnected; falling back to HTTP`);
-          resetWsSession({ sessionId, session });
+          markWsSessionDegraded(session);
+          resetWsSession({
+            session,
+            createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+            preserveDegradeUntil: true,
+          });
           return fallbackToHttp(model, context, options, apiKey, eventStream, opts.signal, {
             suppressStart: emittedStart,
+            turnState: resolveProviderTransportTurnState(model, {
+              sessionId,
+              turnId,
+              attempt: Math.max(1, turnAttempt),
+              transport: "stream",
+            }),
           });
         }
 
@@ -451,7 +730,15 @@ export function createOpenAIWebSocketStreamFn(
               manager: session.manager,
               modelId: model.id,
               tools: convertTools(context.tools),
-              instructions: context.systemPrompt ?? undefined,
+              instructions: context.systemPrompt
+                ? stripSystemPromptCacheBoundary(context.systemPrompt)
+                : undefined,
+              metadata: resolveProviderTransportTurnState(model, {
+                sessionId,
+                turnId,
+                attempt: Math.max(1, turnAttempt),
+                transport: "websocket",
+              })?.metadata,
               signal,
             });
             log.debug(`[ws-stream] warm-up completed for session=${sessionId}`);
@@ -471,12 +758,18 @@ export function createOpenAIWebSocketStreamFn(
               /* ignore */
             }
             try {
+              session.manager = createWsManager(opts.managerOptions, sessionHeaders);
               await session.manager.connect(apiKey);
               session.everConnected = true;
+              session.degradedUntil = null;
               log.debug(`[ws-stream] reconnected after warm-up failure for session=${sessionId}`);
             } catch (reconnectErr) {
-              session.broken = true;
-              wsRegistry.delete(sessionId);
+              markWsSessionDegraded(session);
+              resetWsSession({
+                session,
+                createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+                preserveDegradeUntil: true,
+              });
               if (transport === "websocket") {
                 throw reconnectErr instanceof Error
                   ? reconnectErr
@@ -487,6 +780,12 @@ export function createOpenAIWebSocketStreamFn(
               );
               return fallbackToHttp(model, context, options, apiKey, eventStream, opts.signal, {
                 suppressStart: emittedStart,
+                turnState: resolveProviderTransportTurnState(model, {
+                  sessionId,
+                  turnId,
+                  attempt: Math.max(1, turnAttempt),
+                  transport: "stream",
+                }),
               });
             }
           }
@@ -513,17 +812,27 @@ export function createOpenAIWebSocketStreamFn(
           );
         }
 
-        const payload = buildOpenAIWebSocketResponseCreatePayload({
+        turnAttempt++;
+        const turnState = resolveProviderTransportTurnState(model, {
+          sessionId,
+          turnId,
+          attempt: turnAttempt,
+          transport: "websocket",
+        });
+        let payload = buildOpenAIWebSocketResponseCreatePayload({
           model,
           context,
           options: options as WsOptions | undefined,
           turnInput,
           tools: convertTools(context.tools),
+          metadata: turnState?.metadata,
         }) as Record<string, unknown>;
-        const nextPayload = options?.onPayload?.(payload, model);
-        const requestPayload = (nextPayload ?? payload) as Parameters<
-          OpenAIWebSocketManager["send"]
-        >[0];
+        const nextPayload = await options?.onPayload?.(payload, model);
+        payload = mergeTransportMetadata(
+          (nextPayload ?? payload) as Record<string, unknown>,
+          turnState?.metadata,
+        );
+        const requestPayload = payload as Parameters<OpenAIWebSocketManager["send"]>[0];
 
         try {
           session.manager.send(requestPayload);
@@ -538,16 +847,30 @@ export function createOpenAIWebSocketStreamFn(
             log.warn(
               `[ws-stream] retrying websocket turn after send failure for session=${sessionId} (${runtimeRetries}/${MAX_AUTO_WS_RUNTIME_RETRIES}). error=${normalizedErr.message}`,
             );
-            resetWsSession({ sessionId, session });
+            resetWsSession({
+              session,
+              createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+            });
             continue;
           }
           if (transport !== "websocket") {
             log.warn(
               `[ws-stream] send failed for session=${sessionId}; falling back to HTTP. error=${normalizedErr.message}`,
             );
-            resetWsSession({ sessionId, session });
+            markWsSessionDegraded(session);
+            resetWsSession({
+              session,
+              createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+              preserveDegradeUntil: true,
+            });
             return fallbackToHttp(model, context, options, apiKey, eventStream, opts.signal, {
               suppressStart: emittedStart,
+              turnState: resolveProviderTransportTurnState(model, {
+                sessionId,
+                turnId,
+                attempt: turnAttempt,
+                transport: "stream",
+              }),
             });
           }
           throw normalizedErr;
@@ -680,16 +1003,30 @@ export function createOpenAIWebSocketStreamFn(
             log.warn(
               `[ws-stream] retrying websocket turn after retryable runtime failure for session=${sessionId} (${runtimeRetries}/${MAX_AUTO_WS_RUNTIME_RETRIES}). error=${normalizedErr.message}`,
             );
-            resetWsSession({ sessionId, session });
+            resetWsSession({
+              session,
+              createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+            });
             continue;
           }
           if (transport !== "websocket" && !signal?.aborted && !sawWsOutput) {
             log.warn(
               `[ws-stream] session=${sessionId} runtime failure before output; falling back to HTTP. error=${normalizedErr.message}`,
             );
-            resetWsSession({ sessionId, session });
+            markWsSessionDegraded(session);
+            resetWsSession({
+              session,
+              createManager: () => createWsManager(opts.managerOptions, sessionHeaders),
+              preserveDegradeUntil: true,
+            });
             return fallbackToHttp(model, context, options, apiKey, eventStream, opts.signal, {
               suppressStart: true,
+              turnState: resolveProviderTransportTurnState(model, {
+                sessionId,
+                turnId,
+                attempt: turnAttempt,
+                transport: "stream",
+              }),
             });
           }
           throw normalizedErr;
@@ -718,7 +1055,7 @@ export function createOpenAIWebSocketStreamFn(
 }
 
 /**
- * Fall back to HTTP (`streamSimple`) and pipe events into the existing stream.
+ * Fall back to HTTP and pipe events into the existing stream.
  * This is called when the WebSocket is broken or unavailable.
  */
 async function fallbackToHttp(
@@ -728,14 +1065,41 @@ async function fallbackToHttp(
   apiKey: string,
   eventStream: AssistantMessageEventStreamLike,
   signal?: AbortSignal,
-  fallbackOptions?: { suppressStart?: boolean },
+  fallbackOptions?: {
+    suppressStart?: boolean;
+    turnState?: ProviderTransportTurnState;
+  },
 ): Promise<void> {
+  const baseOnPayload = streamOptions?.onPayload;
   const mergedOptions = {
     ...streamOptions,
     apiKey,
+    ...(fallbackOptions?.turnState?.headers
+      ? {
+          headers: {
+            ...streamOptions?.headers,
+            ...fallbackOptions.turnState.headers,
+          },
+        }
+      : {}),
+    ...(fallbackOptions?.turnState?.metadata
+      ? {
+          onPayload: async (
+            payload: unknown,
+            payloadModel: Parameters<NonNullable<typeof baseOnPayload>>[1],
+          ) => {
+            const nextPayload = await baseOnPayload?.(payload, payloadModel);
+            const resolvedPayload = (nextPayload ?? payload) as Record<string, unknown>;
+            return mergeTransportMetadata(resolvedPayload, fallbackOptions.turnState?.metadata);
+          },
+        }
+      : {}),
     ...(signal ? { signal } : {}),
   };
-  const httpStream = openAIWsStreamDeps.streamSimple(model, context, mergedOptions);
+  const httpStreamFn =
+    openAIWsStreamDeps.createHttpFallbackStreamFn(model as ProviderRuntimeModel) ??
+    openAIWsStreamDeps.streamSimple;
+  const httpStream = await httpStreamFn(model, context, mergedOptions);
   for await (const event of httpStream) {
     if (fallbackOptions?.suppressStart && event.type === "start") {
       continue;
@@ -752,5 +1116,8 @@ export const __testing = {
           ...overrides,
         }
       : defaultOpenAIWsStreamDeps;
+  },
+  setWsDegradeCooldownMsForTest(nextMs?: number) {
+    wsDegradeCooldownMsOverride = nextMs;
   },
 };

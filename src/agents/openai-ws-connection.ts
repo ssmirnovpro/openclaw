@@ -39,9 +39,11 @@ export interface ResponseObject {
 }
 
 export interface UsageInfo {
-  input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
 }
 
 export type OpenAIResponsesAssistantPhase = "commentary" | "final_answer";
@@ -281,6 +283,8 @@ export interface OpenAIWebSocketManagerOptions {
   backoffDelaysMs?: readonly number[];
   /** Custom socket factory for tests. */
   socketFactory?: (url: string, options: ClientOptions) => WebSocket;
+  /** Extra headers merged into the initial WebSocket handshake request. */
+  headers?: Record<string, string>;
   /** Optional transport overrides for provider-owned auth or TLS wiring. */
   request?: ProviderRequestTransportOverrides;
 }
@@ -319,7 +323,7 @@ type InternalEvents = {
  *   }
  * });
  *
- * manager.send({ type: "response.create", model: "gpt-5.2", input: [...] });
+ * manager.send({ type: "response.create", model: "gpt-5.4", input: [...] });
  * ```
  */
 export class OpenAIWebSocketManager extends EventEmitter<InternalEvents> {
@@ -338,6 +342,7 @@ export class OpenAIWebSocketManager extends EventEmitter<InternalEvents> {
   private readonly maxRetries: number;
   private readonly backoffDelaysMs: readonly number[];
   private readonly socketFactory: (url: string, options: ClientOptions) => WebSocket;
+  private readonly headers?: Record<string, string>;
   private readonly request?: ProviderRequestTransportOverrides;
 
   constructor(options: OpenAIWebSocketManagerOptions = {}) {
@@ -347,6 +352,7 @@ export class OpenAIWebSocketManager extends EventEmitter<InternalEvents> {
     this.backoffDelaysMs = options.backoffDelaysMs ?? BACKOFF_DELAYS_MS;
     this.socketFactory =
       options.socketFactory ?? ((url, socketOptions) => new WebSocket(url, socketOptions));
+    this.headers = options.headers;
     this.request = options.request;
   }
 
@@ -454,6 +460,7 @@ export class OpenAIWebSocketManager extends EventEmitter<InternalEvents> {
         providerHeaders: {
           Authorization: `Bearer ${this.apiKey}`,
           "OpenAI-Beta": "responses-websocket=v1",
+          ...this.headers,
         },
         precedence: "defaults-win",
         request: this.request,
@@ -607,7 +614,12 @@ export class OpenAIWebSocketManager extends EventEmitter<InternalEvents> {
    * Sends a warm-up event to pre-load the connection and model without generating output.
    * Pass tools/instructions to prime the connection for the upcoming session.
    */
-  warmUp(params: { model: string; tools?: FunctionToolDefinition[]; instructions?: string }): void {
+  warmUp(params: {
+    model: string;
+    tools?: FunctionToolDefinition[];
+    instructions?: string;
+    metadata?: Record<string, string>;
+  }): void {
     const event = buildOpenAIWebSocketWarmUpPayload(params);
     this.send(event);
   }

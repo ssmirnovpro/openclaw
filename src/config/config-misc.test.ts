@@ -757,6 +757,14 @@ describe("config strict validation", () => {
               },
             },
           },
+          googlechat: {
+            streamMode: "append",
+            accounts: {
+              work: {
+                streamMode: "replace",
+              },
+            },
+          },
           slack: {
             streaming: true,
           },
@@ -769,6 +777,10 @@ describe("config strict validation", () => {
       expect(snap.legacyIssues.some((issue) => issue.path === "channels.telegram")).toBe(true);
       expect(snap.legacyIssues.some((issue) => issue.path === "channels.discord")).toBe(true);
       expect(snap.legacyIssues.some((issue) => issue.path === "channels.discord.accounts")).toBe(
+        true,
+      );
+      expect(snap.legacyIssues.some((issue) => issue.path === "channels.googlechat")).toBe(true);
+      expect(snap.legacyIssues.some((issue) => issue.path === "channels.googlechat.accounts")).toBe(
         true,
       );
       expect(snap.legacyIssues.some((issue) => issue.path === "channels.slack")).toBe(true);
@@ -784,6 +796,16 @@ describe("config strict validation", () => {
       expect(snap.sourceConfig.channels?.discord?.accounts?.work).toMatchObject({
         streaming: "block",
       });
+      expect(
+        (snap.sourceConfig.channels?.googlechat as Record<string, unknown> | undefined)?.streamMode,
+      ).toBeUndefined();
+      expect(
+        (
+          snap.sourceConfig.channels?.googlechat?.accounts?.work as
+            | Record<string, unknown>
+            | undefined
+        )?.streamMode,
+      ).toBeUndefined();
       expect(snap.sourceConfig.channels?.slack).toMatchObject({
         streaming: "partial",
         nativeStreaming: true,
@@ -1033,7 +1055,7 @@ describe("config strict validation", () => {
     });
   });
 
-  it("does not mark resolved-only gateway.bind aliases as auto-migratable legacy", async () => {
+  it("does not treat resolved-only gateway.bind aliases as source-literal legacy or invalid", async () => {
     await withTempHome(async (home) => {
       await writeOpenClawConfig(home, {
         gateway: { bind: "${OPENCLAW_BIND}" },
@@ -1043,9 +1065,9 @@ describe("config strict validation", () => {
       process.env.OPENCLAW_BIND = "0.0.0.0";
       try {
         const snap = await readConfigFileSnapshot();
-        expect(snap.valid).toBe(false);
+        expect(snap.valid).toBe(true);
         expect(snap.legacyIssues).toHaveLength(0);
-        expect(snap.issues.some((issue) => issue.path === "gateway.bind")).toBe(true);
+        expect(snap.issues).toHaveLength(0);
       } finally {
         if (prev === undefined) {
           delete process.env.OPENCLAW_BIND;
